@@ -1,0 +1,370 @@
+================================================================================
+ PLAN DE DESARROLLO E IMPLEMENTACIÓN — (B) TIL_BACKEND
+ API REST con Node.js + Express + MongoDB (Studio3T local / Atlas producción)
+ Repositorio: https://github.com/adrianrico/TIL_Backend.git
+ Despliegue: Render (manual)
+================================================================================
+
+0. RESUMEN EJECUTIVO
+--------------------
+Objetivo: una API única, segura y escalable que sirva a TIL_Superadmin (el
+panel administrador) y a las demás web apps del ecosistema TIL.
+
+Decisiones de arquitectura (y por qué):
+  - Monolito modular ("modular monolith") organizado POR MÓDULOS DE NEGOCIO
+    (auth, til-users, client-auth, apps...). Cada módulo es autónomo
+    (rutas, controlador, servicio, modelo, validación). Escala a nuevos
+    proyectos agregando carpetas en /modules sin tocar el resto, y si algún día
+    un módulo necesita separarse en microservicio, ya está aislado.
+  - Capas dentro de cada módulo: routes -> controller -> service -> model.
+      * routes:     define URL + middlewares (auth, validación).
+      * controller: traduce HTTP (req/res). Sin lógica de negocio.
+      * service:    lógica de negocio. No conoce Express.
+      * model:      esquema Mongoose.
+  - Versionado de API (/api/v1) para no romper clientes al evolucionar.
+  - Configuración 12-factor: todo por variables de entorno, validadas al
+    arrancar (si falta una, el servidor NO inicia).
+  - Selector de base de datos por variable DB_TARGET = local | atlas.
+
+Stack:
+  Node.js >= 20 LTS, Express 4/5, Mongoose, zod (validación), jsonwebtoken,
+  bcryptjs (o argon2), helmet, cors, express-rate-limit, express-mongo-sanitize
+  (o sanitización propia), hpp, compression, cookie-parser, pino + pino-http
+  (logs), dotenv, nodemon (dev), vitest/jest + supertest (pruebas), eslint.
+
+--------------------------------------------------------------------------------
+1. ESTRUCTURA DE CARPETAS (Desktop\TIL_Backend)
+--------------------------------------------------------------------------------
+TIL_Backend/
+├── .env.example            # Plantilla de variables (SÍ se sube a Git)
+├── .env                    # Valores reales (NUNCA se sube; en .gitignore)
+├── .gitignore
+├── .eslintrc.cjs
+├── package.json
+├── README.md
+├── implementación.txt
+├── scripts/
+│   └── seed-admin.js       # Crea/actualiza el admin MAYLOB_CONTROL con hash
+├── src/
+│   ├── server.js           # Arranque: conecta DB y levanta HTTP; apagado limpio
+│   ├── app.js              # Construye Express: middlewares globales + rutas
+│   ├── config/
+│   │   ├── env.js          # Lee y VALIDA variables de entorno (zod)
+│   │   └── db.js           # Conexión Mongoose (local vs atlas)
+│   ├── core/               # Piezas transversales reutilizables por TODOS los módulos
+│   │   ├── errors/AppError.js        # Error operacional con status y code
+│   │   ├── middlewares/
+│   │   │   ├── errorHandler.js       # Manejador central de errores
+│   │   │   ├── notFound.js           # 404 JSON
+│   │   │   ├── validate.js           # Valida body/query/params con zod
+│   │   │   ├── authenticate.js       # Verifica JWT de administrador
+│   │   │   ├── authorize.js          # Control de roles/permisos (RBAC)
+│   │   │   ├── rateLimiters.js       # Límites global y estricto para login
+│   │   │   └── requestId.js          # ID por petición para trazabilidad
+│   │   ├── utils/
+│   │   │   ├── asyncHandler.js       # Captura errores de funciones async
+│   │   │   ├── crypto.js             # hash, comparar, generar passwords seguros
+│   │   │   ├── ids.js                # Generador de identificadores públicos
+│   │   │   └── escapeRegex.js        # Evita ReDoS/inyección en búsquedas
+│   │   └── logger.js                 # pino
+│   ├── modules/
+│   │   ├── index.js                  # Registro central de módulos (monta rutas)
+│   │   ├── health/                   # GET /health (Render health check)
+│   │   ├── auth/                     # Login del ADMIN (MAYLOB_CONTROL)
+│   │   │   ├── auth.routes.js
+│   │   │   ├── auth.controller.js
+│   │   │   ├── auth.service.js
+│   │   │   ├── auth.schemas.js       # zod
+│   │   │   └── admin.model.js
+│   │   ├── til-users/                # CRUD de usuarios + toggle + credenciales
+│   │   │   ├── tilUsers.routes.js
+│   │   │   ├── tilUsers.controller.js
+│   │   │   ├── tilUsers.service.js
+│   │   │   ├── tilUsers.schemas.js
+│   │   │   └── tilUser.model.js
+│   │   └── client-auth/              # Login de los usuarios en la OTRA web app
+│   │       ├── clientAuth.routes.js
+│   │       ├── clientAuth.controller.js
+│   │       ├── clientAuth.service.js
+│   │       └── clientAuth.schemas.js
+│   └── tests/                        # Pruebas con supertest
+└── render.yaml (opcional)            # Infraestructura como código para Render
+
+Para agregar un nuevo proyecto web en el futuro:
+  1) crear src/modules/<nuevo-modulo>/ con las 4 capas,
+  2) registrarlo en src/modules/index.js,
+  3) (si aplica) registrar la app en la colección "apps" con su propia API key.
+Nada más cambia.
+
+--------------------------------------------------------------------------------
+2. PASO A PASO DE IMPLEMENTACIÓN
+--------------------------------------------------------------------------------
+
+PASO 1 — Inicializar proyecto
+  mkdir Desktop\TIL_Backend ; cd TIL_Backend ; git init
+  npm init -y
+  npm i express mongoose dotenv zod jsonwebtoken bcryptjs helmet cors
+        express-rate-limit cookie-parser hpp compression pino pino-http nanoid
+  npm i -D nodemon eslint vitest supertest
+  En package.json:
+     "type": "module",
+     "engines": { "node": ">=20" },
+     "scripts": {
+        "dev":   "nodemon src/server.js",
+        "start": "node src/server.js",
+        "seed:admin": "node scripts/seed-admin.js",
+        "test":  "vitest run",
+        "lint":  "eslint src"
+     }
+
+PASO 2 — .gitignore y .env.example (SEGURIDAD: secretos fuera de Git)
+  .gitignore:  node_modules/  .env  .env.*  !.env.example  logs/  coverage/
+
+  .env.example:
+     NODE_ENV=development            # development | production | test
+     PORT=4000
+     # --- Selector de base de datos ---
+     DB_TARGET=local                 # local -> Studio3T / mongod local ; atlas -> Mongo Atlas
+     MONGO_URI_LOCAL=mongodb://localhost:27017/?retryWrites=true&loadBalanced=false&serverSelectionTimeoutMS=5000&connectTimeoutMS=10000
+     MONGO_URI_ATLAS=mongodb+srv://USUARIO:PASSWORD@CLUSTER.mongodb.net/?retryWrites=true&w=majority
+     DB_NAME=til_platform
+     # --- JWT ---
+     JWT_ACCESS_SECRET=cambia_esto_por_64_bytes_aleatorios
+     JWT_REFRESH_SECRET=otro_secreto_distinto_64_bytes
+     JWT_ACCESS_TTL=15m
+     JWT_REFRESH_TTL=7d
+     # --- CORS (lista blanca separada por comas) ---
+     CORS_ORIGINS=http://localhost:5173
+     # --- Admin inicial (solo lo usa scripts/seed-admin.js) ---
+     ADMIN_USERNAME=MAYLOB_CONTROL
+     ADMIN_PASSWORD=                 # Se define en .env local; NUNCA en el repo
+  Generar secretos: node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+
+  NOTA DE SEGURIDAD: la contraseña indicada para el admin NO se escribe en el
+  código ni en Git. Vive en tu .env local (y en las variables de entorno de
+  Render) y en la BD solo se guarda su HASH bcrypt (cost 12).
+
+PASO 3 — src/config/env.js (validación estricta de entorno)
+  - Importar dotenv/config.
+  - Definir un esquema zod con todas las variables; si falla -> console.error
+    y process.exit(1). Evita arrancar en producción con configuración rota.
+  - Exportar un objeto `env` congelado (Object.freeze).
+  - Regla extra: si NODE_ENV=production, exigir secretos >= 32 caracteres y
+    CORS_ORIGINS sin "*".
+
+PASO 4 — src/config/db.js (cambio local/producción)
+  const uri = env.DB_TARGET === 'atlas' ? env.MONGO_URI_ATLAS : env.MONGO_URI_LOCAL;
+  mongoose.set('strictQuery', true);
+  await mongoose.connect(uri, {
+     dbName: env.DB_NAME,
+     serverSelectionTimeoutMS: 5000,
+     maxPoolSize: 10,
+     autoIndex: env.NODE_ENV !== 'production'   // en prod, índices por migración/arranque controlado
+  });
+  - Eventos 'connected' / 'error' / 'disconnected' -> logger.
+  - Regla de protección: si NODE_ENV=production y DB_TARGET=local -> abortar
+    (evita desplegar apuntando a localhost por error).
+  Uso en Studio3T: conexión nueva a mongodb://localhost:27017 y abrir la base
+  "til_platform"; ahí verás las colecciones admins, tilusers, apps.
+
+PASO 5 — Núcleo (core)
+  AppError(status, code, message, details?)  -> errores esperados.
+  asyncHandler(fn) -> (req,res,next)=>Promise.resolve(fn(req,res,next)).catch(next)
+  errorHandler:
+     - AppError -> responde {error:{code,message,details}} con su status.
+     - ZodError -> 400 con detalle de campos.
+     - Mongoose ValidationError/CastError/E11000 -> 400/409 limpio.
+     - Cualquier otro -> 500 con mensaje genérico (NUNCA exponer stack en prod).
+  validate(schema): parsea {body,query,params} y reemplaza por datos limpios
+     (strip de campos desconocidos = protección contra mass-assignment).
+  requestId: genera UUID por request, lo añade a logs y a header X-Request-Id.
+
+PASO 6 — src/app.js (orden IMPORTANTE de middlewares)
+  1. app.disable('x-powered-by'); app.set('trust proxy', 1)  // Render usa proxy
+  2. requestId + pino-http
+  3. helmet()                      // cabeceras seguras (CSP, HSTS, noSniff...)
+  4. cors({ origin: lista blanca, credentials: true, methods limitados })
+  5. compression()
+  6. rate limit global (p.ej. 300 req / 15 min por IP)
+  7. express.json({ limit: '10kb' })   // límite de tamaño anti-DoS
+  8. cookie-parser
+  9. sanitización NoSQL: eliminar claves que empiecen con '$' o contengan '.'
+     en body/query/params (anti operator-injection {"$gt":""})
+ 10. hpp()                         // contaminación de parámetros
+ 11. rutas: app.use('/api/v1', modulesRouter) ; /health fuera de /api
+ 12. notFound  ->  errorHandler (siempre al final)
+
+PASO 7 — Módulo AUTH (administrador)
+  Modelo Admin:
+     username (unique, indexado), passwordHash, role ('superadmin'),
+     failedAttempts, lockUntil, lastLoginAt, refreshTokenHash/jti, timestamps.
+  Endpoints:
+     POST /api/v1/auth/login     {username,password}
+         - rate limit ESTRICTO (5 intentos / 15 min por IP+usuario).
+         - Busca admin; compara bcrypt SIEMPRE (aunque no exista, comparar con
+           hash falso) para evitar timing attacks / enumeración de usuarios.
+         - Tras 5 fallos -> lockUntil = ahora + 15 min (HTTP 423/429).
+         - Éxito -> access token (15 min, en el cuerpo de respuesta) y refresh
+           token (7 d) en cookie httpOnly, Secure, SameSite=None (front y back
+           están en dominios distintos de Render), path=/api/v1/auth.
+         - Mensaje de error genérico: "Credenciales inválidas".
+     POST /api/v1/auth/refresh   (lee cookie; ROTA el refresh token; invalida
+         el anterior; si detecta reutilización -> revoca la sesión)
+     POST /api/v1/auth/logout    (borra cookie y revoca refresh)
+     GET  /api/v1/auth/me        (requiere access token)
+  Seed: scripts/seed-admin.js lee ADMIN_USERNAME/ADMIN_PASSWORD del entorno,
+     hace bcrypt.hash(pass, 12) y hace upsert. Se corre una vez:  npm run seed:admin
+  Middleware authenticate: lee Authorization: Bearer <token>, verifica firma,
+     expiración, algoritmo fijo (HS256) y issuer/audience; adjunta req.admin.
+  Middleware authorize(...roles): preparado para futuros roles (RBAC).
+
+PASO 8 — Módulo TIL-USERS (usuarios que administra el panel)
+  Modelo TilUser:
+     publicId     String único (ej. "TIL-8F3K2Q9XZ4"), generado con nanoid
+                  (alfabeto sin caracteres ambiguos) en el SERVIDOR. Índice
+                  único. Garantiza que dos usuarios con mismo nombre/teléfono
+                  NUNCA colisionen (la identidad NO depende de nombre/teléfono).
+     fullName     String trim, 2–120.
+     phone        String trim, normalizado (solo dígitos y +), 7–15.
+     registeredAt Date, default Date.now, INMUTABLE (immutable: true) -> fecha
+                  automática de registro; el cliente no puede enviarla.
+     access: {
+        enabled:      Boolean (default false)  // toggle permitir/restringir
+        username:     String (único, sparse)   // = publicId o alias generado
+        passwordHash: String (select:false)    // hash, jamás se devuelve
+        generatedAt:  Date
+        lastLoginAt:  Date
+     }
+     timestamps (createdAt, updatedAt)
+  Índices: publicId (unique), registeredAt, fullName (collation es, strength 2
+     para orden alfabético sin sensibilidad a acentos/mayúsculas),
+     access.enabled, y un índice de texto/prefijo para búsqueda.
+  Endpoints (todos protegidos con authenticate):
+     GET    /api/v1/til-users
+            query: search (nombre), phone, date (YYYY-MM-DD, un día exacto),
+                   dateFrom, dateTo (rango), access (all|allowed|restricted),
+                   sortBy (fullName|registeredAt|access), order (asc|desc),
+                   page (def 1), limit (def 20, máx 100)
+            -> { data:[...], meta:{ total, page, limit, totalPages } }
+            * Escapar regex del texto de búsqueda (escapeRegex) y usar
+              índices; filtros de fecha construidos en UTC con el día completo
+              [00:00:00, 23:59:59.999].
+     POST   /api/v1/til-users           {fullName, phone} -> crea; publicId y
+            registeredAt los asigna el servidor.
+     GET    /api/v1/til-users/:id
+     PATCH  /api/v1/til-users/:id       {fullName?, phone?} (lista blanca)
+     PATCH  /api/v1/til-users/:id/access {enabled:boolean} -> toggle.
+     POST   /api/v1/til-users/:id/credentials
+            -> genera clave de acceso: username + password aleatorio
+               (crypto.randomInt, 14 caracteres, mezcla), guarda SOLO hash y
+               devuelve la contraseña EN CLARO UNA ÚNICA VEZ en esta respuesta
+               (para que el admin se la entregue al usuario). Regenerar
+               invalida la anterior.
+     DELETE /api/v1/til-users/:id       -> eliminación DEFINITIVA (deleteOne).
+  Validación del :id: ObjectId válido (zod + mongoose.isValidObjectId) -> 400.
+
+PASO 9 — Módulo CLIENT-AUTH (puerta de entrada para la OTRA web app)
+  Propósito: la web app "cliente" valida las claves generadas.
+     POST /api/v1/client-auth/login {username,password}
+        - Verifica hash, y que access.enabled === true; si está restringido
+          -> 403 "Acceso restringido" (sin revelar más).
+        - Emite JWT con otro audience ("til-client") y secreto distinto.
+        - Rate limit estricto + bloqueo por intentos fallidos.
+     GET  /api/v1/client-auth/me
+  Así el toggle del panel surte efecto de inmediato: cada login (y cada
+  refresh) revalida access.enabled en BD.
+
+PASO 10 — Escalabilidad multi-proyecto
+  - Colección "apps" (appKey, nombre, origins permitidos, estado, apiKeyHash)
+    para registrar cada web app consumidora. Permite CORS por app, límites por
+    app y revocar una app sin tocar las demás.
+  - Un único registro de módulos (modules/index.js):
+        router.use('/auth', authRoutes) ; router.use('/til-users', tilUsersRoutes) ; ...
+  - Comunicación entre proyectos: autenticación servicio-a-servicio con
+    cabecera X-API-Key (hash en BD) o JWT de servicio con scope.
+  - Mantener contratos estables: versionar (/v2) en vez de romper /v1.
+  - Paginación obligatoria en listados; proyecciones para no traer campos
+    pesados; índices revisados con explain().
+  - Futuro: cola/eventos (BullMQ/Redis) y caché si el tráfico crece; el
+    diseño modular lo permite sin reescribir.
+
+PASO 11 — Seguridad (checklist transversal — PRIORIDAD)
+  [ ] Contraseñas: bcrypt cost 12 (o argon2id). Nunca en claro ni en logs.
+  [ ] JWT: secretos largos y distintos por tipo; expiración corta; algoritmo
+      fijado; refresh con rotación y revocación; audiences separados.
+  [ ] Cookies: httpOnly + Secure + SameSite correcto.
+  [ ] Rate limiting: global y estricto en login/credenciales.
+  [ ] Bloqueo de cuenta por intentos fallidos.
+  [ ] Validación de TODA entrada con zod (lista blanca de campos).
+  [ ] Anti inyección NoSQL (sanitización de $ y .), escape de regex.
+  [ ] helmet, hpp, límite de body 10kb, CORS lista blanca (sin "*").
+  [ ] Errores genéricos al cliente; detalle solo en logs; sin stack en prod.
+  [ ] Logs sin datos sensibles (redact: authorization, password, cookie).
+  [ ] .env fuera de Git; secretos en Render > Environment.
+  [ ] MongoDB Atlas: usuario con mínimo privilegio (readWrite en una BD),
+      IP allowlist (Render ofrece IPs salientes; o 0.0.0.0/0 solo si no hay
+      alternativa y con usuario restringido), TLS (mongodb+srv).
+  [ ] npm audit en CI; dependencias fijadas con package-lock.
+  [ ] Comparaciones en tiempo constante donde aplique; sin enumeración de
+      usuarios en mensajes de error.
+  [ ] Auditoría: registrar quién creó/eliminó/regeneró credenciales
+      (colección auditLogs, opcional pero recomendado).
+  [ ] Credenciales entregadas se muestran una sola vez.
+
+PASO 12 — Pruebas
+  - Unitarias de servicios (generación de password, filtros de fecha).
+  - Integración con supertest + mongodb-memory-server: login ok/fallo/bloqueo,
+    CRUD, filtros, toggle, eliminación, acceso restringido en client-auth.
+  - Correr antes de cada push: npm run lint && npm test.
+
+PASO 13 — Documentación de la API
+  README con tabla de endpoints, variables y ejemplos curl. Opcional:
+  swagger-ui-express con OpenAPI (deshabilitado en producción o protegido).
+
+PASO 14 — Git y GitHub
+  git add . ; git commit -m "feat: base del backend TIL"
+  git branch -M main
+  git remote add origin https://github.com/adrianrico/TIL_Backend.git
+  git push -u origin main
+  Verificar ANTES del push que `.env` no aparece en `git status`.
+  Flujo de ramas sugerido: main (producción) / develop / feature/*.
+
+PASO 15 — Despliegue manual en Render
+  1) Crear MongoDB Atlas: cluster gratuito, usuario BD, allowlist de red,
+     copiar cadena mongodb+srv.
+  2) Render > New > Web Service > conectar repo TIL_Backend.
+  3) Runtime Node; Build Command: npm ci ; Start Command: npm start
+     Health Check Path: /health ; Auto-Deploy: OFF (despliegue manual).
+  4) Variables de entorno: NODE_ENV=production, DB_TARGET=atlas,
+     MONGO_URI_ATLAS, DB_NAME, JWT_ACCESS_SECRET, JWT_REFRESH_SECRET,
+     CORS_ORIGINS=https://<tu-front>.onrender.com, ADMIN_USERNAME, ADMIN_PASSWORD.
+  5) Primer deploy -> Shell de Render (o local apuntando a Atlas):
+     npm run seed:admin  (crea el admin con hash).
+  6) Probar: GET https://<api>.onrender.com/health y login desde el front.
+  7) Nota plan gratuito: el servicio "duerme" tras inactividad; el primer
+     request tarda. Considerar plan de pago o ping de salud.
+  8) Despliegues posteriores: botón "Manual Deploy" > "Deploy latest commit".
+
+PASO 16 — Operación
+  - Apagado limpio: SIGTERM/SIGINT -> cerrar server y mongoose.connection.
+  - Backups de Atlas, alertas, rotación periódica de secretos JWT.
+  - Monitoreo de logs (pino -> Render logs).
+
+--------------------------------------------------------------------------------
+3. CONTRATO DE RESPUESTAS
+--------------------------------------------------------------------------------
+  Éxito:  { "data": ..., "meta": {...opcional} }
+  Error:  { "error": { "code": "VALIDATION_ERROR", "message": "...", "details": [...] } }
+  Códigos: 200, 201, 204 (delete), 400, 401, 403, 404, 409, 423/429, 500.
+
+--------------------------------------------------------------------------------
+4. ORDEN DE TRABAJO RECOMENDADO (hitos)
+--------------------------------------------------------------------------------
+  H1: Pasos 1–6  (esqueleto + conexión DB + /health)         -> corre en local
+  H2: Paso 7     (auth admin + seed)                          -> login funcional
+  H3: Paso 8     (CRUD til-users con filtros/orden/paginación)
+  H4: Paso 9     (credenciales + client-auth + toggle)
+  H5: Pasos 11–12 (endurecimiento + pruebas)
+  H6: Pasos 14–15 (GitHub + Render + Atlas)
+  H7: Paso 10    (colección apps / preparación multi-proyecto)
+================================================================================

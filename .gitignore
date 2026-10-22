@@ -1,0 +1,9 @@
+# Dependencias y artefactos
+node_modules/
+coverage/
+logs/
+# Secretos: NUNCA subir al repositorio
+.env
+.env.*
+!.env.example
+.vitest
