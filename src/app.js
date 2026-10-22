@@ -44,7 +44,7 @@ app.use('/health', healthRoutes);
 
 // 5. Límite general + parseo de cuerpo con tope de tamaño
 app.use(globalLimiter);
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '100kb' }));
 app.use(cookieParser());
 
 // 6. Sanitización NoSQL y parámetros duplicados
