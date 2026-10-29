@@ -9,6 +9,7 @@ import {
   routesRouter,
   transportersRouter,
 } from './forwarder/http/forwarder.routes.js';
+import operatorAuthRoutes from './operator-auth/operatorAuth.routes.js';
 import tilUsersRoutes from './til-users/tilUsers.routes.js';
 
 const router = Router();
@@ -16,6 +17,7 @@ const router = Router();
 router.use('/auth', authRoutes);
 router.use('/til-users', tilUsersRoutes);
 router.use('/client-auth', clientAuthRoutes);
+router.use('/operator-auth', operatorAuthRoutes);
 
 // Datos del forwarder (sesión emitida por client-auth, credenciales creadas en TIL_Superadmin)
 router.use('/clients', clientsRouter);

@@ -31,3 +31,14 @@ export const loginLimiter = rateLimit({
   legacyHeaders: false,
   message: tooMany('TOO_MANY_ATTEMPTS', 'Demasiados intentos, intenta más tarde'),
 });
+
+// Límite de la consulta PÚBLICA por llave MONI (TIL_TRACKER): frena el barrido de llaves.
+// Los intentos exitosos no cuentan, así el sondeo normal (1/min) nunca lo agota.
+export const monitorLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  skipSuccessfulRequests: true,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: tooMany('TOO_MANY_ATTEMPTS', 'Demasiados intentos, intenta más tarde'),
+});

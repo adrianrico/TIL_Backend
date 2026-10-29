@@ -3,8 +3,11 @@
 // de negocio se responden como { code, message } (ver `legacyErrors`).
 import { Router } from 'express';
 import { authenticateClient } from '../../client-auth/clientAuth.controller.js';
+import { monitorLimiter } from '../../../core/middlewares/rateLimiters.js';
 import { AppError as TilAppError } from '../../../core/errors/AppError.js';
 import { TilUser } from '../../til-users/tilUser.model.js';
+import { authenticateOperator } from '../../operator-auth/operatorAuth.controller.js';
+import * as operatorAuth from '../../operator-auth/operatorAuth.service.js';
 import { asyncHandler } from '../../../core/utils/asyncHandler.js';
 import logger from '../shared/logger.js';
 import { AppError, badRequest } from '../shared/appError.js';
@@ -39,6 +42,40 @@ const requireUser = [
     next();
   }),
 ];
+
+// Guardia de OPERADOR (TIL_OPERATOR): token de operador válido Y CURP todavía registrada y disponible.
+const requireOperator = [
+  authenticateOperator,
+  asyncHandler(async (req, res, next) => {
+    const found = await operatorAuth.findOperator(req.operatorCurp);
+    if (!found) throw new TilAppError(401, 'UNAUTHORIZED', 'Sesión inválida');
+    if (found.operator.operator_available === false) throw new TilAppError(403, 'ACCESS_RESTRICTED', 'Tu acceso está restringido');
+    req.operator = { curp: found.operator.operator_id, name: found.operator.operator_name };
+    req.actor = { type: 'operator', name: found.operator.operator_name, curp: found.operator.operator_id };
+    next();
+  }),
+];
+
+// Acepta token de operador o de usuario TIL (el que llegue; se distingue por la audiencia).
+const requireOperatorOrUser = (req, res, next) => {
+  const chain = isOperatorToken(req) ? requireOperator : requireUser;
+  let i = 0;
+  const step = (err) => {
+    if (err || i >= chain.length) return next(err);
+    chain[i++](req, res, step);
+  };
+  step();
+};
+
+function isOperatorToken(req) {
+  try {
+    const token = (req.headers.authorization || '').split(' ')[1];
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+    return payload.aud === operatorAuth.OPERATOR_AUDIENCE;
+  } catch {
+    return false;
+  }
+}
 
 const ok = (res, body) => res.status(200).send({ code: '1', ...body });
 
@@ -80,46 +117,58 @@ transportersRouter.delete('/transporter/', asyncHandler(async (req, res) => {
 
 // ── /routes ─────────────────────────────────────────────────────────────────
 export const routesRouter = Router();
-routesRouter.use(requireUser);
-routesRouter.get('/route', asyncHandler(async (req, res) => {
+routesRouter.get('/route', requireOperatorOrUser, asyncHandler(async (req, res) => {
   const routes_data = await routeService.listRoutes();
   if (routes_data.length === 0) return res.send({ code: '0', message: 'No hay rutas registradas todavía.' });
   ok(res, { routes_data });
 }));
-routesRouter.post('/route', asyncHandler(async (req, res) => {
+routesRouter.post('/route', requireUser, asyncHandler(async (req, res) => {
   const result = await routeService.handleRoute(v.routeDto(req));
   // Contrato histórico: el alta responde code '1' (texto) y route_id; la edición, code 1 (número).
   if (result.created) return ok(res, { message: result.message, route_id: result.route_id });
   res.send({ code: 1, message: result.message });
 }));
-routesRouter.delete('/route/', asyncHandler(async (req, res) => {
+routesRouter.delete('/route/', requireUser, asyncHandler(async (req, res) => {
   ok(res, await routeService.deleteRoute(v.routeDeleteDto(req)));
 }));
 
 // ── /maneuvers ──────────────────────────────────────────────────────────────
 export const maneuversRouter = Router();
-maneuversRouter.use(requireUser);
-maneuversRouter.get('/maneuver/', asyncHandler(async (req, res) => {
+// Consulta PÚBLICA de solo lectura por llave MONI (TIL_TRACKER): sin sesión, con límite propio.
+// Llave inválida o sin maniobras -> 400 (el front la borra); 429 lo emite el limitador.
+maneuversRouter.get('/monitor/', monitorLimiter, asyncHandler(async (req, res) => {
+  const key = v.moniKeyDto(req);
+  if (!key) throw badRequest('Llave no válida.');
+  const maneuvers_data = await maneuverService.listByMoniKey(key);
+  if (maneuvers_data.length === 0) throw badRequest('Llave no válida.');
+  ok(res, { maneuvers_data });
+}));
+maneuversRouter.get('/byOperator/', requireOperator, asyncHandler(async (req, res) => {
+  const maneuvers_data = await maneuverService.listByOperator(req.operator);
+  if (maneuvers_data.length === 0) return res.send({ code: '0', message: 'No tienes maniobras asignadas.', maneuvers_data });
+  ok(res, { maneuvers_data });
+}));
+maneuversRouter.patch('/updateLocation/', requireOperatorOrUser, asyncHandler(async (req, res) => {
+  const { message, man_progress } = await maneuverService.updateLocation(v.updateLocationDto(req), req.actor);
+  ok(res, { message, man_progress });
+}));
+maneuversRouter.get('/maneuver/', requireUser, asyncHandler(async (req, res) => {
   const { maneuvers_data, pagination } = await maneuverService.listManeuvers(v.pagingDto(req));
   if (pagination.total === 0) {
     return res.send({ code: '0', message: 'No hay maniobras registradas todavía.', maneuvers_data, pagination });
   }
   ok(res, { maneuvers_data, pagination });
 }));
-maneuversRouter.post('/maneuver/', asyncHandler(async (req, res) => {
+maneuversRouter.post('/maneuver/', requireUser, asyncHandler(async (req, res) => {
   ok(res, await maneuverService.handleManeuver(v.maneuverDto(req)));
 }));
-maneuversRouter.delete('/maneuver/', asyncHandler(async (req, res) => {
+maneuversRouter.delete('/maneuver/', requireUser, asyncHandler(async (req, res) => {
   ok(res, await maneuverService.deleteManeuver(v.maneuverDeleteDto(req)));
 }));
-maneuversRouter.get('/stats/', asyncHandler(async (req, res) => {
+maneuversRouter.get('/stats/', requireUser, asyncHandler(async (req, res) => {
   const range = v.statsDto(req);
   if (range.error) throw badRequest(range.error);
   ok(res, { stats: await maneuverService.getStats(range) });
-}));
-maneuversRouter.patch('/updateLocation/', asyncHandler(async (req, res) => {
-  const { message, man_progress } = await maneuverService.updateLocation(v.updateLocationDto(req), req.actor);
-  ok(res, { message, man_progress });
 }));
 
 // Errores de negocio del módulo con el contrato histórico { code, message }.
